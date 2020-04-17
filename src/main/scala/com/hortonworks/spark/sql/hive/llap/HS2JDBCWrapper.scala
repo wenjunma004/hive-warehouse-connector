@@ -17,21 +17,25 @@
 
 package com.hortonworks.spark.sql.hive.llap
 
+import com.hortonworks.spark.sql.hive.llap.common.HWConf;
 import java.net.URI
-import java.sql.{Connection, DatabaseMetaData, Driver, DriverManager, ResultSet, ResultSetMetaData,
-  SQLException}
-import java.util.Properties
+import java.sql.{Connection, DatabaseMetaData, Driver, DriverManager, ResultSet, ResultSetMetaData, SQLException}
+import java.util.{Properties, StringJoiner}
+
+import com.hortonworks.spark.sql.hive.llap.common.{Column, DescribeTableOutput, DriverResultSet}
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
-
 import org.apache.commons.dbcp2.BasicDataSource
 import org.apache.commons.dbcp2.BasicDataSourceFactory
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector.Category
 import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector.PrimitiveCategory
 import org.apache.hadoop.hive.serde2.typeinfo._
+import org.apache.spark.sql.{Row, RowFactory}
+import org.apache.spark.sql.catalyst.expressions.GenericRow
 import org.apache.spark.sql.types._
 import org.slf4j.LoggerFactory
+
 
 object Utils {
   def classForName(className: String): Class[_] = {
@@ -130,10 +134,260 @@ class JDBCWrapper {
     }
   }
 
-  def resolveQuery(conn: Connection, currentDatabase: String, query: String): StructType = {
-    if (currentDatabase != null) {
-      conn.prepareStatement(s"USE $currentDatabase").execute()
+  /**
+    * Checks if table exists in database.
+    *
+    * @param conn JDBC connection
+    * @param dbName Database name
+    * @param tableName Name of the table for which existence is to be checked
+    * @return true if table exists in database, false otherwise.
+    */
+  def tableExists(conn: Connection, dbName: String, tableName: String): Boolean = {
+    val dbMeta: DatabaseMetaData = conn.getMetaData
+    val rs: ResultSet = dbMeta.getTables(null, dbName, tableName, null)
+    try {
+      while (rs.next()) {
+        val tableNameFromDB: String = rs.getString("TABLE_NAME")
+        if (tableNameFromDB != null && tableNameFromDB.equalsIgnoreCase(tableName)) return true
+      }
+    } finally {
+      rs.close()
     }
+    false
+  }
+
+  /**
+    * Gets all the column names of specified table
+    *
+    * @param conn JDBC connection
+    * @param dbName Database name
+    * @param tableName Table name
+    * @return array of column names
+    */
+  def getTableColumns(conn: Connection, dbName: String, tableName: String): Array[String] = {
+    val dbMeta: DatabaseMetaData = conn.getMetaData
+    val rs: ResultSet = dbMeta.getColumns(null, dbName, tableName, null)
+    try {
+      val columns = new ArrayBuffer[String]()
+      while (rs.next()) {
+        columns += rs.getString("COLUMN_NAME")
+      }
+      columns.toArray
+    } finally {
+      rs.close()
+    }
+  }
+
+  /**
+    * Executes 'describe formatted' on given table
+    * As of now, only populates columns and partitioned columns.
+    *
+    * @param conn JDBC connection
+    * @param dbName Database name
+    * @param tableName Table name
+    * @return DescribeTableOutput
+    */
+  def describeTable(conn: Connection, dbName: String, tableName: String): DescribeTableOutput = {
+    useDatabase(conn, dbName)
+    val stmt = conn.prepareStatement(s"DESC FORMATTED $dbName.$tableName")
+    val rs: ResultSet = stmt.executeQuery()
+    try {
+      var partInfoSeen = false
+      var detailedInfoSeen = false
+      var storageInfoSeen = false
+      val columns = new java.util.ArrayList[Column]()
+      val partitionedCols = new java.util.ArrayList[Column]()
+      val detailedInfoCols = new java.util.ArrayList[Column]()
+      val storageInfoCols = new java.util.ArrayList[Column]()
+
+      while (rs.next()) {
+        val colName = rs.getString("col_name")
+        if (!colName.trim.isEmpty && !colName.startsWith("#")) {
+          val dataType = rs.getString("data_type")
+          val comment = rs.getString("comment")
+          val column = new Column(colName.trim, dataType, comment)
+          if (storageInfoSeen) {
+            storageInfoCols.add(column)
+          } else if (detailedInfoSeen) {
+            detailedInfoCols.add(column)
+          } else if (partInfoSeen) {
+            partitionedCols.add(column)
+          } else {
+            columns.add(column)
+          }
+
+        } else if (colName.startsWith("# Partition Information")) {
+          partInfoSeen = true
+        } else if (colName.startsWith("# Detailed Table Information")) {
+          detailedInfoSeen = true
+        } else if (colName.startsWith("# Storage Information")) {
+          storageInfoSeen = true
+        }
+      }
+      val describeTableOutput = new DescribeTableOutput
+      describeTableOutput.setColumns(columns)
+      describeTableOutput.setPartitionedColumns(partitionedCols)
+      describeTableOutput.setDetailedTableInfo(detailedInfoCols)
+      describeTableOutput.setStorageInfo(storageInfoCols)
+      describeTableOutput
+    } finally {
+      rs.close()
+    }
+  }
+
+  /**
+    * Drops the table.
+    * @param conn JDBC connection
+    * @param dbName Database name
+    * @param tableName Table name
+    * @param ifExists IF EXISTS option for DROP query
+    */
+  def dropTable(conn: Connection, dbName: String, tableName: String, ifExists: Boolean): Unit = {
+    val dropTableQuery = s"DROP TABLE ${if (ifExists) "IF EXISTS " else ""}$tableName"
+    executeUpdate(conn, dbName, dropTableQuery, throwOnException = true)
+  }
+
+  /**
+    * Truncates the table.
+    * @param conn JDBC connection
+    * @param dbName Database name
+    * @param tableName Table name
+    */
+  def truncateTable(conn: Connection, dbName: String, tableName: String): Unit = {
+    val truncateTableQuery = s"TRUNCATE TABLE $tableName"
+    executeUpdate(conn, dbName, truncateTableQuery, throwOnException = true)
+  }
+
+
+  /**
+    * Unsets table properties.
+    * @param conn JDBC connection
+    * @param dbName Database name
+    * @param tableName Table name
+    * @param ifExists IF EXISTS option, i.e. UNSET TBLPROPERTIES IF EXISTS...
+    * @param propertyKeys property keys to unset
+    */
+  @annotation.varargs
+  def unsetTableProperties(conn: Connection, dbName: String, tableName: String, ifExists: Boolean,
+                           propertyKeys: String*): Unit = {
+    val joiner = new StringJoiner(",", "'", "'")
+    propertyKeys.foreach(key => joiner.add(key))
+    val query = s"ALTER TABLE $tableName UNSET TBLPROPERTIES" +
+      s" ${if (ifExists) "IF EXISTS " else ""}($joiner)"
+
+    executeUpdate(conn, dbName, query, throwOnException = true)
+  }
+
+  def populateSchemaFields(ncols: Int,
+                           rsmd: ResultSetMetaData,
+                           fields: Array[StructField]): Unit = {
+    var i = 0
+    while (i < ncols) {
+      // HIVE-11750 - ResultSetMetadata.getColumnName() has format tablename.columnname
+      // Hack to remove the table name
+      val columnName = rsmd.getColumnLabel(i + 1).split("\\.").last
+      val dataType = rsmd.getColumnType(i + 1)
+      val typeName = rsmd.getColumnTypeName(i + 1)
+      val fieldSize = rsmd.getPrecision(i + 1)
+      val fieldScale = rsmd.getScale(i + 1)
+      val isSigned = true
+      val nullable = rsmd.isNullable(i + 1) != ResultSetMetaData.columnNoNulls
+      val columnType = getCatalystType(dataType, typeName, fieldSize, fieldScale, isSigned)
+      fields(i) = StructField(columnName, columnType, nullable)
+      i = i + 1
+    }
+  }
+
+  // Used for executing queries directly from the Driver to HS2
+  // ResultSet size is limited to prevent Driver OOM
+  // Should not be used for processing of big data
+  // Useful for DDL instrospection statements like 'show tables'
+ def executeStmt(conn: Connection,
+                 currentDatabase: String,
+                 query: String,
+                 maxExecResults: Long): DriverResultSet = {
+    useDatabase(conn, currentDatabase)
+    val stmt = conn.prepareStatement(query)
+    stmt.setMaxRows(maxExecResults.asInstanceOf[Int])
+    val rs = stmt.executeQuery()
+    log.debug(query)
+    try {
+      val rsmd = rs.getMetaData
+      val ncols = rsmd.getColumnCount
+      val fields = new Array[StructField](ncols)
+      populateSchemaFields(ncols, rsmd, fields)
+      val schema = new StructType(fields)
+      val data = new java.util.ArrayList[Row]()
+      while(rs.next()) {
+        val rowData = new Array[Any](ncols)
+        for (j <- 0 to ncols - 1) {
+          rowData(j) = rs.getObject(j + 1)
+        }
+        val row = new GenericRow(rowData)
+        data.add(row)
+      }
+      return new common.DriverResultSet(data, schema)
+    } finally {
+      rs.close()
+      stmt.close()
+    }
+  }
+
+  // Used for executing statements directly from the Driver to HS2
+  // with no results
+  // Useful for DDL statements like 'create table'
+  def executeUpdate(conn: Connection,
+                  currentDatabase: String,
+                  query: String): Boolean = {
+    executeUpdate(conn, currentDatabase, query, throwOnException = false)
+  }
+
+  // Used for executing statements directly from the Driver to HS2
+  // with no results
+  // Useful for DDL statements like 'create table'
+  def executeUpdate(conn: Connection,
+                    currentDatabase: String,
+                    query: String, throwOnException: Boolean): Boolean = {
+    useDatabase(conn, currentDatabase)
+    val stmt = conn.prepareStatement(query)
+    log.debug(query)
+    //TODO Workaround until HIVE-14388 provides stmt.numRowsAffected
+    try {
+      stmt.execute()
+      true
+    } catch {
+      case e: Exception =>
+        if (throwOnException) {
+          throw e
+        }
+        log.error(s"executeUpdate failed for query: ${query}", e)
+        false
+    } finally {
+      stmt.close()
+    }
+  }
+
+  def useDatabase(conn: Connection, currentDatabase: String) {
+    if (currentDatabase != null) {
+      val stmt = conn.prepareStatement(s"USE $currentDatabase")
+      stmt.execute()
+      stmt.close()
+    }
+  }
+
+  @annotation.varargs
+  def setSessionLevelProps(conn: Connection, props: String*) {
+    if (props != null) {
+      val stmt = conn.createStatement()
+      for (elem <- props) {
+        stmt.execute(s"SET $elem")
+      }
+      stmt.close()
+    }
+  }
+
+  def resolveQuery(conn: Connection, currentDatabase: String, query: String): StructType = {
+    useDatabase(conn, currentDatabase)
     val schemaQuery = s"SELECT * FROM ($query) q LIMIT 0"
     val rs = conn.prepareStatement(schemaQuery).executeQuery()
     log.debug(schemaQuery)
@@ -141,21 +395,7 @@ class JDBCWrapper {
       val rsmd = rs.getMetaData
       val ncols = rsmd.getColumnCount
       val fields = new Array[StructField](ncols)
-      var i = 0
-      while (i < ncols) {
-        // HIVE-11750 - ResultSetMetadata.getColumnName() has format tablename.columnname
-        // Hack to remove the table name
-        val columnName = rsmd.getColumnLabel(i + 1).split("\\.").last
-        val dataType = rsmd.getColumnType(i + 1)
-        val typeName = rsmd.getColumnTypeName(i + 1)
-        val fieldSize = rsmd.getPrecision(i + 1)
-        val fieldScale = rsmd.getScale(i + 1)
-        val isSigned = true
-        val nullable = rsmd.isNullable(i + 1) != ResultSetMetaData.columnNoNulls
-        val columnType = getCatalystType(dataType, typeName, fieldSize, fieldScale, isSigned)
-        fields(i) = StructField(columnName, columnType, nullable)
-        i = i + 1
-      }
+      populateSchemaFields(ncols, rsmd, fields)
       new StructType(fields)
     } finally {
       rs.close()
@@ -191,6 +431,7 @@ class JDBCWrapper {
           properties.setProperty("maxTotal", "40")
           properties.setProperty("maxIdle", "10")
           properties.setProperty("maxWaitMillis", "30000")
+          properties.setProperty("logExpiredConnections", "false")
         } else {
           dbcp2Configs.split(" ").map(s => s.trim.split(":")).foreach {
             conf =>
@@ -206,6 +447,15 @@ class JDBCWrapper {
         connectionPools.put(userName, dataSource)
         dataSource.getConnection
     }
+  }
+
+  def getConnector(sessionState: HiveWarehouseSessionState): Connection = {
+    return getConnector(
+      Option.empty,
+      HWConf.RESOLVED_HS2_URL.getString(sessionState),
+      HWConf.USER.getString(sessionState),
+      HWConf.DBCP2_CONF.getString(sessionState)
+    )
   }
 
   def columnString(dataType: DataType, dataSize: Option[Long]): String = dataType match {
